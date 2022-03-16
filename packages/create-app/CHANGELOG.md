@@ -1,5 +1,13 @@
 # @cloud-carbon-footprint/create-app
 
+## 1.3.1
+
+### Patch Changes
+
+- ff05607b: Bumps to latest version of typescript and sets resolution for this
+
+  See [this commit](https://github.com/cloud-carbon-footprint/cloud-carbon-footprint/commit/6cdc1469dcd5380c9c8a84b9fe13b977991db54c) for changes to the create-app templates.
+
 ## 1.3.0
 
 ### Minor Changes
