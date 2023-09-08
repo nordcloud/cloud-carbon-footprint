@@ -1,22 +1,21 @@
 {
   "compilerOptions": {
     "module": "commonjs",
-    "noImplicitAny": true,
     "removeComments": true,
     "preserveConstEnums": true,
     "sourceMap": true,
-    "lib": ["es2019"],
+    "lib": ["ES2021"],
     "esModuleInterop": true,
     "rootDir": "./src",
     "baseUrl": ".",
     "outDir": "./dist",
     "experimentalDecorators": true,
-    "target": "ES5",
+    "target": "ES2021",
     "downlevelIteration": true,
     "resolveJsonModule": true,
     "noImplicitReturns": true,
     "declaration": true,
   },
   "include": ["./src"],
-  "exclude": ["node_modules", "scripts", "**/__tests__/**" , "**/*.test.*",]
+  "exclude": ["./node_modules", "scripts", "**/__tests__/**" , "**/*.test.*",]
 }

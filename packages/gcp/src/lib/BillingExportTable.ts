@@ -16,6 +16,7 @@ import {
   Logger,
   LookupTableInput,
   LookupTableOutput,
+  TagCollection,
 } from '@cloud-carbon-footprint/common'
 
 import {
@@ -86,12 +87,16 @@ export default class BillingExportTable {
     end: Date,
     grouping: GroupBy,
   ): Promise<EstimationResult[]> {
-    const usageRows = await this.getUsage(start, end, grouping)
+    const gcpConfig = configLoader().GCP
+    const tagNames = gcpConfig.RESOURCE_TAG_NAMES
+    const usageRows = await this.getUsage(start, end, grouping, tagNames)
 
     const results: MutableEstimationResult[] = []
     const unknownRows: BillingExportRow[] = []
 
+    this.billingExportTableLogger.info('Mapping over Usage Rows')
     usageRows.map((usageRow) => {
+      usageRow.tags = this.rawTagsToTagCollection(usageRow)
       const billingExportRow = new BillingExportRow(usageRow)
       const footprintEstimate = this.getFootprintEstimateFromUsageRow(
         billingExportRow,
@@ -103,6 +108,7 @@ export default class BillingExportTable {
           billingExportRow,
           footprintEstimate,
           grouping,
+          tagNames,
         )
     })
 
@@ -115,6 +121,7 @@ export default class BillingExportTable {
             rowData,
             footprintEstimate,
             grouping,
+            tagNames,
           )
       })
     }
@@ -130,7 +137,7 @@ export default class BillingExportTable {
     inputData.map((inputDataRow: LookupTableInput) => {
       const usageRow = {
         serviceName: inputDataRow.serviceName,
-        usageAmount: 1,
+        usageAmount: 3600,
         usageType: inputDataRow.usageType,
         usageUnit: inputDataRow.usageUnit,
         cost: 1,
@@ -140,6 +147,16 @@ export default class BillingExportTable {
       }
 
       const billingExportRow = new BillingExportRow(usageRow)
+
+      // if there is a machineType. override vCpuHours value,
+      // since it is set using usageAmount, which is always 1 for lookup table generation
+      if (billingExportRow.machineType) {
+        const { instancevCpu } = this.getDataFromMachineType(
+          billingExportRow.machineType,
+        )
+        billingExportRow.vCpuHours = instancevCpu * billingExportRow.vCpuHours
+      }
+
       const footprintEstimate = this.getFootprintEstimateFromUsageRow(
         billingExportRow,
         unknownRows,
@@ -149,7 +166,6 @@ export default class BillingExportTable {
           serviceName: billingExportRow.serviceName,
           region: billingExportRow.region,
           usageType: billingExportRow.usageType,
-          usageUnit: billingExportRow.usageUnit,
           machineType: billingExportRow.machineType,
           kilowattHours: footprintEstimate.kilowattHours,
           co2e: footprintEstimate.co2e,
@@ -165,7 +181,6 @@ export default class BillingExportTable {
             serviceName: billingExportRow.serviceName,
             region: billingExportRow.region,
             usageType: billingExportRow.usageType,
-            usageUnit: billingExportRow.usageUnit,
             machineType: billingExportRow.machineType,
             kilowattHours: footprintEstimate.kilowattHours,
             co2e: footprintEstimate.co2e,
@@ -285,8 +300,7 @@ export default class BillingExportTable {
         usageRow.usageType,
       )
     } else {
-      computeProcessors = this.getComputeProcessorsFromUsageType(
-        usageRow.usageType,
+      computeProcessors = this.getComputeProcessorsFromMachineType(
         usageRow.machineType,
       )
     }
@@ -316,16 +330,13 @@ export default class BillingExportTable {
     return computeFootprint
   }
 
-  private getComputeProcessorsFromUsageType(
-    usageType: string,
-    machineType: string,
-  ): string[] {
+  private getComputeProcessorsFromMachineType(machineType: string): string[] {
     const sharedCoreMatch =
       machineType &&
       Object.values(SHARED_CORE_PROCESSORS).find((core) =>
         machineType.includes(core),
       )
-    const includesPrefix = usageType.substring(0, 2).toLowerCase()
+    const includesPrefix = machineType?.substring(0, 2).toLowerCase()
     const processor = sharedCoreMatch ? sharedCoreMatch : includesPrefix
 
     return (
@@ -586,11 +597,35 @@ export default class BillingExportTable {
     )[0]
   }
 
+  /* Note about resource tags:
+   * GCP supports three methods for labeling resources: tags (organization-level), project labels (project-level), and normal labels (resource-level).
+   * We support all three under one config with the use of prefixes to specify the type of label that a key corresponds to.
+   * The resulting key/value pairs are then merged into a single "tag" property for each resource.
+   */
   private async getUsage(
     start: Date,
     end: Date,
     grouping: GroupBy,
+    tagNames: string[],
   ): Promise<RowMetadata[]> {
+    const startDate = new Date(
+      moment.utc(start).startOf('day') as unknown as Date,
+    )
+    const endDate = new Date(moment.utc(end).endOf('day') as unknown as Date)
+
+    const [tags, projectLabels, labels] = this.tagNamesToQueryColumns(tagNames)
+
+    const [tagPropertySelections, tagPropertyJoins] = buildTagQuery(
+      'tags',
+      tags,
+    )
+    const [labelPropertySelections, labelPropertyJoins] = buildTagQuery(
+      'labels',
+      labels,
+    )
+    const [projectLabelPropertySelections, projectLabelPropertyJoins] =
+      buildTagQuery('projectLabels', projectLabels)
+
     const query = `SELECT
                     DATE_TRUNC(DATE(usage_start_time), ${
                       GCP_QUERY_GROUP_BY[grouping]
@@ -604,20 +639,25 @@ export default class BillingExportTable {
                     system_labels.value AS machineType,
                     SUM(usage.amount) AS usageAmount,
                     SUM(cost) AS cost
+                    ${tagPropertySelections}
+                    ${labelPropertySelections}
+                    ${projectLabelPropertySelections}
                   FROM
                     \`${this.tableName}\`
                   LEFT JOIN
                     UNNEST(system_labels) AS system_labels
                     ON system_labels.key = "compute.googleapis.com/machine_spec"
+                  ${tagPropertyJoins}
+                  ${labelPropertyJoins}
+                  ${projectLabelPropertyJoins}
                   WHERE
                     cost_type != 'rounding_error'
                     AND usage.unit IN ('byte-seconds', 'seconds', 'bytes', 'requests')
-                    AND usage_start_time >= TIMESTAMP('${moment
-                      .utc(start)
-                      .format('YYYY-MM-DD')}')
-                    AND usage_end_time <= TIMESTAMP('${moment
-                      .utc(end)
-                      .format('YYYY-MM-DD')}')
+                    AND usage_start_time BETWEEN TIMESTAMP('${moment
+                      .utc(startDate)
+                      .format('YYYY-MM-DDTHH:mm:ssZ')}') AND TIMESTAMP('${moment
+      .utc(endDate)
+      .format('YYYY-MM-DDTHH:mm:ssZ')}')
                   GROUP BY
                     timestamp,
                     accountId,
@@ -635,6 +675,7 @@ export default class BillingExportTable {
   private async getQueryResults(job: Job) {
     let rows: RowMetadata
     try {
+      this.billingExportTableLogger.info('Getting Big Query Results')
       ;[rows] = await job.getQueryResults()
     } catch (e) {
       const { reason, domain, message } = e.errors[0]
@@ -648,13 +689,75 @@ export default class BillingExportTable {
   private async createQueryJob(query: string) {
     let job: Job
     try {
-      ;[job] = await this.bigQuery.createQueryJob({ query: query })
+      ;[job] = await this.bigQuery.createQueryJob({ query })
     } catch (e) {
-      const { reason, location, message } = e.errors[0]
+      let errorMessage = e
+      if (e.errors) {
+        const { reason, location, message } = e.errors[0]
+        errorMessage = `${reason}, Location: ${location}, Message: ${message}`
+      }
       throw new Error(
-        `BigQuery create Query Job failed. Reason: ${reason}, Location: ${location}, Message: ${message}`,
+        `BigQuery create Query Job failed. Reason: ${errorMessage}`,
       )
     }
     return job
   }
+
+  private tagNamesToQueryColumns(tagNames: string[]): string[][] {
+    const tagColumns: { [column: string]: string[] } = {
+      tag: [],
+      project: [],
+      label: [],
+    }
+
+    // For each string in tag label, check the colon-separated prefix to determine which type of label it is
+    tagNames.forEach((tag) => {
+      const [prefix, key] = tag.split(':')
+      const column = tagColumns[prefix]
+      if (column) {
+        column.push(key)
+      } else {
+        this.billingExportTableLogger.warn(
+          `Unknown tag prefix: ${prefix}. Ignoring tag: ${tag}`,
+        )
+      }
+    })
+
+    return Object.values(tagColumns)
+  }
+
+  private rawTagsToTagCollection(usageRow: any): TagCollection {
+    const parsedTags: TagCollection = {}
+    const options = ['tags', 'projectLabels', 'labels']
+
+    options.forEach((option) => {
+      const tags: string = usageRow[option]
+      if (tags) {
+        tags.split(', ').forEach((tag) => {
+          const [key, value] = tag.split(': ')
+          parsedTags[key] = value
+        })
+      }
+    })
+
+    return parsedTags
+  }
+}
+
+export const buildTagQuery = (columnName: string, keys: string[]): string[] => {
+  let propertySelections = '',
+    propertyJoins = ''
+
+  if (keys.length > 0) {
+    propertySelections = `, STRING_AGG(DISTINCT CONCAT(${columnName}.key, ": ", ${columnName}.value), ", ") AS ${columnName}`
+
+    propertyJoins = `\nLEFT JOIN\n UNNEST(${
+      columnName === 'projectLabels' ? 'project.labels' : columnName
+    }) AS ${columnName}\n`
+    const keyJoins = keys
+      .map((tag) => `${columnName}.key = "${tag}"`)
+      .join(' OR ')
+    propertyJoins += `ON ${keyJoins}`
+  }
+  return [propertySelections, propertyJoins]
 }
