@@ -1,5 +1,17 @@
 # @cloud-carbon-footprint/common
 
+## 1.13.2
+
+### Patch Changes
+
+- 9737749f: Fixes issue with unit conversions for Electricity Map Carbon Intensity values
+
+## 1.13.1
+
+### Patch Changes
+
+- db1b66fe: fixes console warning in common
+
 ## 1.13.0
 
 ### Minor Changes
